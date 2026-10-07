@@ -1,140 +1,100 @@
-﻿using System.Collections;
-using System.Security.Cryptography;
+﻿using System.Buffers.Binary;
 using System.Text;
-
 
 namespace Serializer;
 
-public sealed class VaultEntry
+public static class VaultSerializer
 {
-    private byte[] _password = Array.Empty<byte>();
-    private byte[] _serviceName = Array.Empty<byte>();
-    private byte[] _login = Array.Empty<byte>();
-    private byte[] _additionalInfo = Array.Empty<byte>();
-    public byte[] Password
+    private const int MaxFieldSize = 16 * 1024 * 1024; // 16 MiB — защита от мусора в файле
+
+
+    public static Vault Serialize(ReadOnlySpan<byte> data)
     {
-        get => _password;
-        set => _password = value ?? Array.Empty<byte>();
-    }
+        var vault = new Vault();
+        int offset = 0;
 
-    public byte[] ServiceName
-    {
-        get => _serviceName;
-        set => _serviceName = value ?? Array.Empty<byte>();
-    }
-
-    public byte[] Login
-    {
-        get => _login;
-        set => _login = value ?? Array.Empty<byte>();
-    }
-
-    public byte[] AdditionalInfo
-    {
-        get => _additionalInfo;
-        set => _additionalInfo = value ?? Array.Empty<byte>();
-    }
-    public string GetPasswordString() => Encoding.UTF8.GetString(_password);
-
-    public void ClearPassword() => CryptographicOperations.ZeroMemory(_password);
-
-    public string GetServiceNameString() => Encoding.UTF8.GetString(_serviceName);
-
-    public void ClearServiceName() => CryptographicOperations.ZeroMemory(_serviceName);
-
-    public string GetLoginString() => Encoding.UTF8.GetString(_login);
-
-    public void ClearLogin() => CryptographicOperations.ZeroMemory(_login);
-
-    public string GetAdditionalInfoString() => Encoding.UTF8.GetString(_additionalInfo);
-
-    public void ClearAdditionalInfo() => CryptographicOperations.ZeroMemory(_additionalInfo);
-
-    public void ClearVaultEntry()
-    {
-        ClearPassword();
-        ClearLogin();
-        ClearAdditionalInfo();
-        ClearServiceName();
-    }
-}
-
-public sealed class Vault
-{
-    private VaultEntry[] _entries;
-
-    public int Length {get {return _entries.Length;}} 
-
-    public Vault()
-    {
-        _entries = Array.Empty<VaultEntry>();
-    }
-    public Vault(VaultEntry[] entries)
-    {
-        _entries = entries ?? Array.Empty<VaultEntry>();
-    }
-
-    ~Vault()
-    {
-        foreach (var i in _entries)
+        while (offset < data.Length)
         {
-            i.ClearVaultEntry();
-        }
-    }
+            byte[] serviceName = ReadField(data, ref offset);
+            byte[] login       = ReadField(data, ref offset);
+            byte[] password    = ReadField(data, ref offset);
+            byte[] addInfo     = ReadField(data, ref offset);
 
-    public void AddVaultEntry(VaultEntry newVault)
-    {
-        _entries.Append(newVault);
-    }
+            var entry = new VaultEntry
+            {
+                ServiceName = serviceName,
+                Login = login,
+                Password = password,
+                AdditionalInfo = addInfo,
+            };
+            vault.AddVaultEntry(entry);
 
-    public IEnumerator<VaultEntry> GetEnumerator()
-    {
-        foreach (VaultEntry i in _entries)
-        {
-            yield return i;
-        }
-    }
-}
-
-public sealed class Serializer
-{
-    public static Vault Serialize(byte[] data)
-    {
-        Vault vault = new Vault();
-        for (int i = 0; i < data.Length; ++i)
-        {
-            
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(serviceName);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(login);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(password);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(addInfo);
         }
 
-        return vault;    
+        return vault;
     }
 
-    public static byte[] Deserialize(Vault data)
+
+    public static byte[] Deserialize(Vault vault)
     {
-        byte[] deserializedArray = [];
+        ArgumentNullException.ThrowIfNull(vault);
 
-        foreach (var i in data)
+        long totalSize = 0;
+        foreach (var entry in vault)
         {
-            byte[] servNameLength = BitConverter.GetBytes(i.ServiceName.Length);
-            byte[] loginLength = BitConverter.GetBytes(i.Login.Length);
-            byte[] passwordLength = BitConverter.GetBytes(i.Password.Length);
-            byte[] addInfoLength = BitConverter.GetBytes(i.AdditionalInfo.Length);
-
-            deserializedArray.Concat(servNameLength);
-            deserializedArray.Concat(i.ServiceName);
-            deserializedArray.Concat(loginLength);
-            deserializedArray.Concat(i.Login);
-            deserializedArray.Concat(passwordLength);
-            deserializedArray.Concat(i.Password);
-            deserializedArray.Concat(addInfoLength);
-            deserializedArray.Concat(i.AdditionalInfo);
-            CryptographicOperations.ZeroMemory(servNameLength);
-            CryptographicOperations.ZeroMemory(passwordLength);
-            CryptographicOperations.ZeroMemory(loginLength);
-            CryptographicOperations.ZeroMemory(addInfoLength);
+            totalSize += 4 + entry.ServiceName.Length;
+            totalSize += 4 + entry.Login.Length;
+            totalSize += 4 + entry.Password.Length;
+            totalSize += 4 + entry.AdditionalInfo.Length;
         }
 
-        return deserializedArray;
-    } 
+        if (totalSize > int.MaxValue)
+            throw new InvalidOperationException("Vault is too large to serialize");
 
+        byte[] result = new byte[(int)totalSize];
+        int offset = 0;
+
+        foreach (var entry in vault)
+        {
+            WriteField(result, ref offset, entry.ServiceName);
+            WriteField(result, ref offset, entry.Login);
+            WriteField(result, ref offset, entry.Password);
+            WriteField(result, ref offset, entry.AdditionalInfo);
+        }
+
+        return result;
+    }
+
+
+    private static byte[] ReadField(ReadOnlySpan<byte> data, ref int offset)
+    {
+        if (offset + 4 > data.Length)
+            throw new InvalidDataException("Corrupted vault: truncated length");
+
+        int length = BinaryPrimitives.ReadInt32LittleEndian(data[offset..]);
+        offset += 4;
+
+        if (length < 0 || length > MaxFieldSize)
+            throw new InvalidDataException($"Corrupted vault: invalid field length {length}");
+
+        if (offset + length > data.Length)
+            throw new InvalidDataException("Corrupted vault: truncated field data");
+
+        byte[] result = data.Slice(offset, length).ToArray();
+        offset += length;
+        return result;
+    }
+
+    private static void WriteField(byte[] target, ref int offset, byte[] value)
+    {
+        BinaryPrimitives.WriteInt32LittleEndian(target.AsSpan(offset), value.Length);
+        offset += 4;
+
+        value.CopyTo(target.AsSpan(offset));
+        offset += value.Length;
+    }
 }
